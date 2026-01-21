@@ -23,6 +23,7 @@ from memory.manager import MemoryManager
 from llm.orchestrator import LLMOrchestrator
 from transport.websocket import ConnectionManager, InboundMessage
 from transport.handlers import MessageHandler
+from api.auth.routes import router as auth_router, set_db_pool as set_auth_db_pool
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -56,6 +57,9 @@ async def lifespan(app: FastAPI):
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
         logger.info("Database connected")
 
+        # Set db_pool for auth module
+        set_auth_db_pool(db_pool)
+
         async with db_pool.acquire() as conn:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     except Exception as e:
@@ -87,6 +91,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include auth router
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
 
 connection_manager = ConnectionManager()
 
