@@ -123,3 +123,55 @@ CREATE TABLE memory_versions (
     updated_by_user_id UUID NOT NULL REFERENCES users(id),
     PRIMARY KEY (memory_id, version)
 );
+
+-- ============================================================
+-- AUTHENTICATION TABLES
+-- ============================================================
+
+-- User credentials (email/password authentication)
+CREATE TABLE user_credentials (
+    user_id UUID PRIMARY KEY REFERENCES users(id),
+    email TEXT UNIQUE NOT NULL,
+    email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_user_credentials_email ON user_credentials(email);
+
+-- Verification codes (email verification, password reset)
+CREATE TABLE verification_codes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id),
+    code TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_verification_codes_user ON verification_codes(user_id);
+
+-- User sessions (multi-device management, refresh tokens)
+CREATE TABLE user_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id),
+    refresh_token_hash TEXT NOT NULL,
+    device_info JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_user_sessions_user ON user_sessions(user_id);
+CREATE INDEX idx_user_sessions_token ON user_sessions(refresh_token_hash);
+
+-- User PINs (biometric fallback unlock)
+CREATE TABLE user_pins (
+    user_id UUID PRIMARY KEY REFERENCES users(id),
+    pin_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
