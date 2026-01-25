@@ -175,3 +175,29 @@ CREATE TABLE user_pins (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ============================================================
+-- REAL-TIME PRESENCE & RECEIPTS
+-- ============================================================
+
+-- User presence tracking per room
+CREATE TABLE user_presence (
+    user_id UUID NOT NULL REFERENCES users(id),
+    room_id UUID NOT NULL REFERENCES rooms(id),
+    status TEXT NOT NULL DEFAULT 'offline',
+    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, room_id)
+);
+
+CREATE INDEX idx_user_presence_room_status ON user_presence(room_id, status);
+
+-- Message delivery and read receipts
+CREATE TABLE message_receipts (
+    message_id UUID NOT NULL REFERENCES messages(id),
+    user_id UUID NOT NULL REFERENCES users(id),
+    receipt_type TEXT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (message_id, user_id, receipt_type)
+);
+
+CREATE INDEX idx_message_receipts_message ON message_receipts(message_id);
