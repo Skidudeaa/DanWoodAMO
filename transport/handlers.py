@@ -51,6 +51,10 @@ class MessageHandler:
             MessageTypes.EDIT_MEMORY: self._handle_edit_memory,
             MessageTypes.INVALIDATE_MEMORY: self._handle_invalidate_memory,
             MessageTypes.PING: self._handle_ping,
+            MessageTypes.PRESENCE_HEARTBEAT: self._handle_presence_heartbeat,
+            MessageTypes.PRESENCE_UPDATE: self._handle_presence_update,
+            MessageTypes.MESSAGE_DELIVERED: self._handle_message_delivered,
+            MessageTypes.MESSAGE_READ: self._handle_message_read,
         }
 
         handler = handlers.get(message.type)
@@ -336,6 +340,148 @@ class MessageHandler:
             type=MessageTypes.PONG,
             payload={"timestamp": datetime.utcnow().isoformat()},
         ))
+
+    async def _handle_presence_heartbeat(self, conn: Connection, payload: dict) -> None:
+        """
+        Handle presence heartbeat from client.
+        Updates user status to 'online' and broadcasts to room.
+        """
+        now = datetime.utcnow()
+
+        # Upsert presence record
+        await self.db.execute(
+            """INSERT INTO user_presence (user_id, room_id, status, last_heartbeat)
+               VALUES ($1, $2, 'online', $3)
+               ON CONFLICT (user_id, room_id)
+               DO UPDATE SET status = 'online', last_heartbeat = $3""",
+            conn.user_id, conn.room_id, now
+        )
+
+        # Broadcast presence update to room (exclude sender)
+        await self.connections.broadcast(conn.room_id, OutboundMessage(
+            type=MessageTypes.PRESENCE_BROADCAST,
+            payload={
+                "user_id": str(conn.user_id),
+                "status": "online",
+                "timestamp": now.isoformat(),
+            },
+        ), exclude_user=conn.user_id)
+
+    async def _handle_presence_update(self, conn: Connection, payload: dict) -> None:
+        """
+        Handle explicit presence status change from client.
+        Status can be 'online', 'away', or 'offline'.
+        """
+        status = payload.get("status", "online")
+        if status not in ("online", "away", "offline"):
+            await self._send_error(conn, f"Invalid presence status: {status}")
+            return
+
+        now = datetime.utcnow()
+
+        # Update presence record
+        await self.db.execute(
+            """INSERT INTO user_presence (user_id, room_id, status, last_heartbeat)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (user_id, room_id)
+               DO UPDATE SET status = $3, last_heartbeat = $4""",
+            conn.user_id, conn.room_id, status, now
+        )
+
+        # Broadcast presence update to room (exclude sender)
+        await self.connections.broadcast(conn.room_id, OutboundMessage(
+            type=MessageTypes.PRESENCE_BROADCAST,
+            payload={
+                "user_id": str(conn.user_id),
+                "status": status,
+                "timestamp": now.isoformat(),
+            },
+        ), exclude_user=conn.user_id)
+
+    async def _handle_message_delivered(self, conn: Connection, payload: dict) -> None:
+        """
+        Handle delivery receipt from client.
+        Records that a message was delivered to the user.
+        """
+        message_id = payload.get("message_id")
+        if not message_id:
+            await self._send_error(conn, "message_id required")
+            return
+
+        from uuid import UUID
+        message_uuid = UUID(message_id)
+        now = datetime.utcnow()
+
+        # Insert delivery receipt (ignore if already exists)
+        await self.db.execute(
+            """INSERT INTO message_receipts (message_id, user_id, receipt_type, timestamp)
+               VALUES ($1, $2, 'delivered', $3)
+               ON CONFLICT (message_id, user_id, receipt_type) DO NOTHING""",
+            message_uuid, conn.user_id, now
+        )
+
+        # Get message sender to notify them
+        sender_row = await self.db.fetchrow(
+            "SELECT user_id FROM messages WHERE id = $1",
+            message_uuid
+        )
+
+        if sender_row and sender_row['user_id']:
+            # Send delivery receipt to sender only
+            await self.connections.send_to_user(
+                sender_row['user_id'],
+                conn.room_id,
+                OutboundMessage(
+                    type=MessageTypes.DELIVERY_RECEIPT,
+                    payload={
+                        "message_id": str(message_uuid),
+                        "status": "delivered",
+                        "recipient_id": str(conn.user_id),
+                    },
+                )
+            )
+
+    async def _handle_message_read(self, conn: Connection, payload: dict) -> None:
+        """
+        Handle read receipt from client.
+        Records that a message was read by the user.
+        """
+        message_id = payload.get("message_id")
+        if not message_id:
+            await self._send_error(conn, "message_id required")
+            return
+
+        from uuid import UUID
+        message_uuid = UUID(message_id)
+        now = datetime.utcnow()
+
+        # Insert read receipt (ignore if already exists)
+        await self.db.execute(
+            """INSERT INTO message_receipts (message_id, user_id, receipt_type, timestamp)
+               VALUES ($1, $2, 'read', $3)
+               ON CONFLICT (message_id, user_id, receipt_type) DO NOTHING""",
+            message_uuid, conn.user_id, now
+        )
+
+        # Get message sender to notify them
+        sender_row = await self.db.fetchrow(
+            "SELECT user_id FROM messages WHERE id = $1",
+            message_uuid
+        )
+
+        if sender_row and sender_row['user_id']:
+            # Send read receipt to sender only
+            await self.connections.send_to_user(
+                sender_row['user_id'],
+                conn.room_id,
+                OutboundMessage(
+                    type=MessageTypes.READ_RECEIPT,
+                    payload={
+                        "message_id": str(message_uuid),
+                        "reader_id": str(conn.user_id),
+                    },
+                )
+            )
 
     async def _send_error(self, conn: Connection, error: str) -> None:
         """Send error to client."""
