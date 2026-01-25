@@ -181,6 +181,11 @@ class MessageTypes:
     EDIT_MEMORY = "edit_memory"
     INVALIDATE_MEMORY = "invalidate_memory"
     PING = "ping"
+    # Presence & receipts (inbound)
+    PRESENCE_HEARTBEAT = "presence_heartbeat"
+    PRESENCE_UPDATE = "presence_update"
+    MESSAGE_DELIVERED = "message_delivered"
+    MESSAGE_READ = "message_read"
 
     # Outbound
     MESSAGE_CREATED = "message_created"
@@ -195,3 +200,7 @@ class MessageTypes:
     LLM_STREAMING = "llm_streaming"
     ERROR = "error"
     PONG = "pong"
+    # Presence & receipts (outbound)
+    PRESENCE_BROADCAST = "presence_update"
+    DELIVERY_RECEIPT = "delivery_receipt"
+    READ_RECEIPT = "read_receipt"
