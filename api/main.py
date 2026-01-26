@@ -246,6 +246,20 @@ class PaginatedMessagesResponse(BaseModel):
     newest_sequence: Optional[int]
 
 
+class UpdateRoomSettingsRequest(BaseModel):
+    """Request to update room LLM heuristic settings."""
+    interjection_turn_threshold: Optional[int] = None
+    semantic_novelty_threshold: Optional[float] = None
+    auto_interjection_enabled: Optional[bool] = None
+
+
+class RoomSettingsResponse(BaseModel):
+    """Current room LLM heuristic settings."""
+    interjection_turn_threshold: int
+    semantic_novelty_threshold: float
+    auto_interjection_enabled: bool
+
+
 # ============================================================
 # REST ENDPOINTS
 # ============================================================
@@ -454,6 +468,105 @@ async def get_thread_genealogy(
             roots.append(node)
 
     return roots
+
+
+@app.get("/rooms/{room_id}/settings", response_model=RoomSettingsResponse)
+async def get_room_settings(
+    room_id: UUID,
+    token: str = Query(...),
+    db=Depends(get_db),
+):
+    """
+    Get current LLM heuristic settings for a room.
+
+    ARCHITECTURE: Direct room table query.
+    WHY: Settings are stored on room record, not separate table.
+    """
+    room = await verify_room_token(room_id, token, db)
+
+    return RoomSettingsResponse(
+        interjection_turn_threshold=room.interjection_turn_threshold,
+        semantic_novelty_threshold=room.semantic_novelty_threshold,
+        auto_interjection_enabled=room.auto_interjection_enabled,
+    )
+
+
+@app.patch("/rooms/{room_id}/settings", response_model=RoomSettingsResponse)
+async def update_room_settings(
+    room_id: UUID,
+    request: UpdateRoomSettingsRequest,
+    token: str = Query(...),
+    user_id: UUID = Query(...),
+    db=Depends(get_db),
+):
+    """
+    Update LLM heuristic settings for a room.
+
+    ARCHITECTURE: Dynamic UPDATE query with only provided fields.
+    WHY: Allows partial updates without overwriting unspecified fields.
+    TRADEOFF: Slightly more complex than full replacement, but safer.
+    """
+    await verify_room_token(room_id, token, db)
+
+    # Build dynamic UPDATE query with only provided fields
+    updates = []
+    params = [room_id]
+    param_idx = 2
+
+    if request.interjection_turn_threshold is not None:
+        # Validate range per RESEARCH.md: 2-12
+        if request.interjection_turn_threshold < 2 or request.interjection_turn_threshold > 12:
+            raise HTTPException(
+                status_code=400,
+                detail="interjection_turn_threshold must be between 2 and 12"
+            )
+        updates.append(f"interjection_turn_threshold = ${param_idx}")
+        params.append(request.interjection_turn_threshold)
+        param_idx += 1
+
+    if request.semantic_novelty_threshold is not None:
+        # Validate range per RESEARCH.md: 0.3-0.95
+        if request.semantic_novelty_threshold < 0.3 or request.semantic_novelty_threshold > 0.95:
+            raise HTTPException(
+                status_code=400,
+                detail="semantic_novelty_threshold must be between 0.3 and 0.95"
+            )
+        updates.append(f"semantic_novelty_threshold = ${param_idx}")
+        params.append(request.semantic_novelty_threshold)
+        param_idx += 1
+
+    if request.auto_interjection_enabled is not None:
+        updates.append(f"auto_interjection_enabled = ${param_idx}")
+        params.append(request.auto_interjection_enabled)
+        param_idx += 1
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No settings to update")
+
+    # Execute update
+    query = f"UPDATE rooms SET {', '.join(updates)} WHERE id = $1"
+    await db.execute(query, *params)
+
+    # Log event
+    await db.execute(
+        """INSERT INTO events (id, timestamp, event_type, room_id, user_id, payload)
+           VALUES ($1, $2, $3, $4, $5, $6)""",
+        uuid4(), datetime.utcnow(), EventType.ROOM_SETTINGS_UPDATED.value,
+        room_id, user_id, request.model_dump(exclude_none=True)
+    )
+
+    # Return updated settings
+    row = await db.fetchrow(
+        """SELECT interjection_turn_threshold, semantic_novelty_threshold, auto_interjection_enabled
+           FROM rooms WHERE id = $1""",
+        room_id
+    )
+
+    return RoomSettingsResponse(
+        interjection_turn_threshold=row['interjection_turn_threshold'],
+        semantic_novelty_threshold=row['semantic_novelty_threshold'],
+        auto_interjection_enabled=row['auto_interjection_enabled'],
+    )
 
 
 @app.get("/threads/{thread_id}/messages", response_model=PaginatedMessagesResponse)
