@@ -349,16 +349,23 @@ async def list_threads(
     ) for row in rows]
 
 
-@app.get("/threads/{thread_id}/messages")
+@app.get("/threads/{thread_id}/messages", response_model=PaginatedMessagesResponse)
 async def get_messages(
     thread_id: UUID,
     token: str = Query(...),
     include_ancestry: bool = True,
-    limit: int = 100,
-    before_sequence: Optional[int] = None,
+    limit: int = Query(50, ge=1, le=200, description="Max messages to return"),
+    before_sequence: Optional[int] = Query(None, description="Return messages before this sequence"),
+    after_sequence: Optional[int] = Query(None, description="Return messages after this sequence"),
     db=Depends(get_db),
 ):
-    """Get messages in a thread."""
+    """
+    Get messages in a thread with cursor-based pagination.
+
+    ARCHITECTURE: Bidirectional cursor pagination using sequence numbers.
+    WHY: Enables infinite scroll in both directions and precise positioning.
+    TRADEOFF: Slightly more complex than offset pagination, but stable under mutations.
+    """
     thread_row = await db.fetchrow(
         "SELECT * FROM threads WHERE id = $1", thread_id
     )
@@ -369,28 +376,80 @@ async def get_messages(
 
     if include_ancestry:
         from operations import get_thread_messages
-        messages = await get_thread_messages(db, thread_id, include_ancestry=True)
-        if before_sequence:
-            messages = [m for m in messages if m.sequence < before_sequence]
-        messages = messages[-limit:]
+        all_messages = await get_thread_messages(db, thread_id, include_ancestry=True)
+
+        # Apply cursor filters
+        if before_sequence is not None:
+            all_messages = [m for m in all_messages if m.sequence < before_sequence]
+            # Get most recent N (from end)
+            messages = all_messages[-limit:]
+        elif after_sequence is not None:
+            all_messages = [m for m in all_messages if m.sequence > after_sequence]
+            # Get oldest N (from start)
+            messages = all_messages[:limit]
+        else:
+            # Default: most recent messages
+            messages = all_messages[-limit:]
+
+        # Calculate has_more flags
+        if messages:
+            oldest_seq = min(m.sequence for m in messages)
+            newest_seq = max(m.sequence for m in messages)
+            has_more_before = any(m.sequence < oldest_seq for m in all_messages)
+            has_more_after = any(m.sequence > newest_seq for m in all_messages)
+        else:
+            oldest_seq = None
+            newest_seq = None
+            has_more_before = False
+            has_more_after = False
     else:
-        query = """
-            SELECT * FROM messages
-            WHERE thread_id = $1 AND NOT is_deleted
-        """
-        params = [thread_id]
+        # Build query based on cursor direction
+        if after_sequence is not None:
+            query = """
+                SELECT * FROM messages
+                WHERE thread_id = $1 AND NOT is_deleted AND sequence > $2
+                ORDER BY sequence ASC LIMIT $3
+            """
+            rows = await db.fetch(query, thread_id, after_sequence, limit)
+            messages = [Message(**dict(row)) for row in rows]
+        elif before_sequence is not None:
+            query = """
+                SELECT * FROM messages
+                WHERE thread_id = $1 AND NOT is_deleted AND sequence < $2
+                ORDER BY sequence DESC LIMIT $3
+            """
+            rows = await db.fetch(query, thread_id, before_sequence, limit)
+            messages = [Message(**dict(row)) for row in reversed(rows)]
+        else:
+            # Default: most recent messages
+            query = """
+                SELECT * FROM messages
+                WHERE thread_id = $1 AND NOT is_deleted
+                ORDER BY sequence DESC LIMIT $2
+            """
+            rows = await db.fetch(query, thread_id, limit)
+            messages = [Message(**dict(row)) for row in reversed(rows)]
 
-        if before_sequence:
-            query += " AND sequence < $2"
-            params.append(before_sequence)
+        # Calculate has_more flags
+        if messages:
+            oldest_seq = min(m.sequence for m in messages)
+            newest_seq = max(m.sequence for m in messages)
 
-        query += f" ORDER BY sequence DESC LIMIT ${len(params) + 1}"
-        params.append(limit)
+            has_more_before = await db.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id = $1 AND NOT is_deleted AND sequence < $2)",
+                thread_id, oldest_seq
+            )
+            has_more_after = await db.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id = $1 AND NOT is_deleted AND sequence > $2)",
+                thread_id, newest_seq
+            )
+        else:
+            oldest_seq = None
+            newest_seq = None
+            has_more_before = False
+            has_more_after = False
 
-        rows = await db.fetch(query, *params)
-        messages = [Message(**dict(row)) for row in reversed(rows)]
-
-    return [MessageResponse(
+    message_responses = [MessageResponse(
         id=m.id,
         thread_id=m.thread_id,
         sequence=m.sequence,
@@ -400,6 +459,14 @@ async def get_messages(
         message_type=m.message_type.value if hasattr(m.message_type, 'value') else m.message_type,
         content=m.content,
     ) for m in messages]
+
+    return PaginatedMessagesResponse(
+        messages=message_responses,
+        has_more_before=has_more_before,
+        has_more_after=has_more_after,
+        oldest_sequence=oldest_seq,
+        newest_sequence=newest_seq,
+    )
 
 
 @app.post("/threads/{thread_id}/messages")
