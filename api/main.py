@@ -2,7 +2,7 @@
 
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID, uuid4
 import asyncpg
 import logging
@@ -195,6 +195,27 @@ class ThreadResponse(BaseModel):
     parent_thread_id: Optional[UUID]
     title: Optional[str]
     message_count: int
+
+
+class SearchResultResponse(BaseModel):
+    """Full-text search result with highlighted snippet."""
+    id: UUID
+    thread_id: UUID
+    content: str
+    snippet: str  # With highlighted matches
+    sender_name: str
+    speaker_type: str
+    created_at: datetime
+    rank: float
+
+
+class PaginatedMessagesResponse(BaseModel):
+    """Paginated messages with cursor information."""
+    messages: List[MessageResponse]
+    has_more_before: bool
+    has_more_after: bool
+    oldest_sequence: Optional[int]
+    newest_sequence: Optional[int]
 
 
 # ============================================================
@@ -606,6 +627,151 @@ async def search_memories(
         "content": m.content,
         "score": m.score,
     } for m in matches]
+
+
+# ============================================================
+# FULL-TEXT SEARCH ENDPOINTS
+# ============================================================
+
+@app.get("/messages/search", response_model=List[SearchResultResponse])
+async def search_messages(
+    q: str = Query(..., min_length=1, description="Search query"),
+    thread_id: Optional[UUID] = Query(None, description="Filter by thread"),
+    date_from: Optional[datetime] = Query(None, description="Filter from date"),
+    date_to: Optional[datetime] = Query(None, description="Filter to date"),
+    speaker_type: Optional[str] = Query(None, description="Filter by speaker type"),
+    limit: int = Query(50, ge=1, le=200, description="Max results"),
+    token: str = Query(...),
+    user_id: UUID = Query(...),
+    db=Depends(get_db),
+):
+    """
+    Full-text search over messages.
+
+    ARCHITECTURE: Uses PostgreSQL tsvector with plainto_tsquery for search.
+    WHY: Native FTS is fast, ranked, and supports stemming/normalization.
+    TRADEOFF: Less flexible than Elasticsearch, but zero infrastructure overhead.
+    """
+    # Build query with room membership check
+    query = """
+        SELECT
+            m.id,
+            m.thread_id,
+            m.content,
+            ts_headline('english', m.content, plainto_tsquery('english', $1),
+                'StartSel=<mark>, StopSel=</mark>, MaxWords=50, MinWords=20'
+            ) as snippet,
+            COALESCE(u.display_name, m.speaker_type) as sender_name,
+            m.speaker_type,
+            m.created_at,
+            ts_rank(m.search_vector, plainto_tsquery('english', $1)) as rank
+        FROM messages m
+        JOIN threads t ON m.thread_id = t.id
+        JOIN room_memberships rm ON t.room_id = rm.room_id
+        LEFT JOIN users u ON m.user_id = u.id
+        WHERE rm.user_id = $2
+          AND m.search_vector @@ plainto_tsquery('english', $1)
+          AND NOT m.is_deleted
+    """
+    params = [q, user_id]
+    param_idx = 3
+
+    if thread_id:
+        query += f" AND m.thread_id = ${param_idx}"
+        params.append(thread_id)
+        param_idx += 1
+
+    if date_from:
+        query += f" AND m.created_at >= ${param_idx}"
+        params.append(date_from)
+        param_idx += 1
+
+    if date_to:
+        query += f" AND m.created_at <= ${param_idx}"
+        params.append(date_to)
+        param_idx += 1
+
+    if speaker_type:
+        query += f" AND m.speaker_type = ${param_idx}"
+        params.append(speaker_type)
+        param_idx += 1
+
+    query += f" ORDER BY rank DESC, m.created_at DESC LIMIT ${param_idx}"
+    params.append(limit)
+
+    rows = await db.fetch(query, *params)
+
+    return [SearchResultResponse(
+        id=row['id'],
+        thread_id=row['thread_id'],
+        content=row['content'],
+        snippet=row['snippet'],
+        sender_name=row['sender_name'],
+        speaker_type=row['speaker_type'],
+        created_at=row['created_at'],
+        rank=float(row['rank']),
+    ) for row in rows]
+
+
+@app.get("/threads/{thread_id}/messages/context")
+async def get_message_context(
+    thread_id: UUID,
+    message_id: UUID = Query(..., description="Target message ID"),
+    context: int = Query(25, ge=1, le=100, description="Messages before/after"),
+    token: str = Query(...),
+    db=Depends(get_db),
+):
+    """
+    Get messages around a target message for jump-to navigation.
+
+    ARCHITECTURE: Uses sequence numbers for efficient range queries.
+    WHY: Enables precise cursor positioning when jumping to search results.
+    """
+    # Verify thread exists and user has access
+    thread_row = await db.fetchrow(
+        "SELECT * FROM threads WHERE id = $1", thread_id
+    )
+    if not thread_row:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    await verify_room_token(thread_row['room_id'], token, db)
+
+    # Get target message sequence
+    target = await db.fetchrow(
+        "SELECT sequence FROM messages WHERE id = $1 AND thread_id = $2",
+        message_id, thread_id
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="Message not found in thread")
+
+    target_sequence = target['sequence']
+
+    # Get surrounding messages
+    rows = await db.fetch(
+        """
+        SELECT * FROM messages
+        WHERE thread_id = $1
+          AND NOT is_deleted
+          AND sequence BETWEEN $2 AND $3
+        ORDER BY sequence ASC
+        """,
+        thread_id,
+        max(1, target_sequence - context),
+        target_sequence + context,
+    )
+
+    messages = [Message(**dict(row)) for row in rows]
+
+    return [MessageResponse(
+        id=m.id,
+        thread_id=m.thread_id,
+        sequence=m.sequence,
+        created_at=m.created_at,
+        speaker_type=m.speaker_type.value if hasattr(m.speaker_type, 'value') else m.speaker_type,
+        user_id=m.user_id,
+        message_type=m.message_type.value if hasattr(m.message_type, 'value') else m.message_type,
+        content=m.content,
+    ) for m in messages]
 
 
 # ============================================================
