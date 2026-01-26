@@ -639,6 +639,85 @@ class MessageHandler:
             },
         ))
 
+    async def _should_send_push(self, user_id: UUID, room_id: UUID) -> bool:
+        """
+        Check if user should receive push notification.
+        Returns False if user is actively connected to the room (foreground suppression).
+        """
+        # Check if user has active WebSocket connection to this room
+        if self.connections.is_user_connected(user_id, room_id):
+            return False
+
+        # Check user's presence status - only push if offline or away
+        presence = await self.db.fetchrow(
+            "SELECT status FROM user_presence WHERE user_id = $1 AND room_id = $2",
+            user_id, room_id
+        )
+        # Send push if no presence record or status is not 'online'
+        return presence is None or presence['status'] != 'online'
+
+    async def _trigger_push_notifications(
+        self,
+        room_id: UUID,
+        thread_id: UUID,
+        message: Message,
+        sender_name: str,
+        sender_id: UUID,
+    ) -> None:
+        """Send push notifications to offline/away room members."""
+        from api.notifications.service import push_service, calculate_badge_count
+
+        # Get room members except sender, respecting mute settings
+        members = await self.db.fetch(
+            """
+            SELECT rm.user_id FROM room_memberships rm
+            LEFT JOIN room_notification_settings rns
+                ON rm.user_id = rns.user_id AND rm.room_id = rns.room_id
+            WHERE rm.room_id = $1
+              AND rm.user_id != $2
+              AND (rns.muted IS NULL OR rns.muted = false)
+              AND (rns.muted_until IS NULL OR rns.muted_until < NOW())
+            """,
+            room_id, sender_id
+        )
+
+        if not members:
+            return
+
+        # Filter to users who should receive push (not actively connected)
+        recipients = []
+        for member in members:
+            if await self._should_send_push(member['user_id'], room_id):
+                recipients.append(str(member['user_id']))
+
+        if not recipients:
+            return
+
+        # Calculate badge counts for each recipient
+        badge_counts = {}
+        for user_id in recipients:
+            badge_counts[user_id] = await calculate_badge_count(self.db, user_id)
+
+        # Determine if LLM message
+        is_llm = message.speaker_type.value in ('LLM_PRIMARY', 'LLM_PROVOKER')
+        display_name = "Claude" if is_llm else sender_name
+
+        # Send push notifications (fire and forget, don't block message flow)
+        try:
+            await push_service.send_message_notification(
+                db=self.db,
+                recipient_user_ids=recipients,
+                room_id=str(room_id),
+                thread_id=str(thread_id),
+                message_id=str(message.id),
+                sender_name=display_name,
+                content=message.content,
+                is_llm=is_llm,
+                badge_counts=badge_counts,
+            )
+        except Exception as e:
+            logger.warning(f"Push notification failed: {e}")
+
     async def _send_error(self, conn: Connection, error: str) -> None:
         """Send error to client."""
         await self.connections.send_to_user(conn.user_id, conn.room_id, OutboundMessage(
