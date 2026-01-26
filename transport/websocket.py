@@ -150,8 +150,17 @@ class ConnectionManager:
             return []
         return [conn.user_id for conn in self._rooms[room_id]]
 
+    def get_user_connections(self, user_id: UUID, room_id: UUID) -> list[Connection]:
+        """
+        Get all active connections for a user in a specific room.
+        Used to determine if user is currently viewing the room (foreground suppression).
+        """
+        if room_id not in self._rooms:
+            return []
+        return [conn for conn in self._rooms[room_id] if conn.user_id == user_id]
+
     def is_user_connected(self, user_id: UUID, room_id: UUID) -> bool:
-        """Check if user is connected to room."""
+        """Check if user has any active WebSocket connections to room."""
         return (user_id, room_id) in self._users
 
 
