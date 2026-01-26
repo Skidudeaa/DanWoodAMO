@@ -2,8 +2,9 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import AsyncIterator, Optional
 from uuid import UUID, uuid4
+import hashlib
 import logging
 import sys
 sys.path.insert(0, '/root/DwoodAmo/dialectic')
@@ -12,10 +13,11 @@ from models import (
     Room, User, Thread, Message, Memory, Event, EventType,
     SpeakerType, MessageType, MessageCreatedPayload
 )
-from .providers import ProviderName, LLMRequest
+from .providers import ProviderName, LLMRequest, get_provider
 from .router import ModelRouter, RoutingResult
 from .heuristics import InterjectionEngine, InterjectionDecision
 from .prompts import PromptBuilder, AssembledPrompt
+from .context import assemble_context
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +194,95 @@ class LLMOrchestrator:
             routing=routing,
             prompt_used=prompt,
         )
+
+    async def stream_response(
+        self,
+        room: Room,
+        thread: Thread,
+        users: list[User],
+        messages: list[Message],
+        memories: list[Memory],
+        use_provoker: bool = False,
+    ) -> AsyncIterator[tuple[str, dict]]:
+        """
+        Stream LLM response token-by-token.
+
+        Yields tuples of (event_type, data) where event_type is:
+        - "thinking": Processing started
+        - "streaming": Token received {"token": str, "index": int}
+        - "done": Complete {"message_id": str, "content": str, "model_used": str, "truncated": bool}
+        - "error": Failed {"error": str, "partial_content": str}
+        """
+        # Signal processing started
+        yield ("thinking", {})
+
+        # Apply context truncation
+        context = assemble_context(messages, thread)
+        truncated_messages = context.messages
+
+        logger.info(
+            f"Context assembled: {context.included_count}/{context.original_count} messages, "
+            f"truncated={context.truncated}, tokens={context.total_tokens}"
+        )
+
+        # Build prompt with truncated messages
+        prompt = self.prompt_builder.build(
+            room=room,
+            users=users,
+            messages=truncated_messages,
+            memories=memories,
+            is_provoker=use_provoker,
+        )
+
+        # Create request for streaming
+        model = room.provoker_model if use_provoker else room.primary_model
+        request = LLMRequest(
+            messages=prompt.messages,
+            system=prompt.system,
+            model=model,
+            stream=True,
+        )
+
+        # Get provider directly for streaming
+        provider_name = ProviderName(room.primary_provider)
+        provider = get_provider(provider_name)
+
+        # Track accumulated content
+        accumulated_content = ""
+        token_index = 0
+
+        try:
+            async for token in provider.stream(request):
+                accumulated_content += token
+                yield ("streaming", {"token": token, "index": token_index})
+                token_index += 1
+
+            # Persist the complete message
+            speaker_type = SpeakerType.LLM_PROVOKER if use_provoker else SpeakerType.LLM_PRIMARY
+            prompt_hash = hashlib.sha256(prompt.system.encode()).hexdigest()[:16]
+
+            response_message = await self._persist_response(
+                thread=thread,
+                content=accumulated_content,
+                speaker_type=speaker_type,
+                model_used=model,
+                prompt_hash=prompt_hash,
+                token_count=0,  # Not available from streaming
+            )
+
+            yield ("done", {
+                "message_id": str(response_message.id),
+                "content": accumulated_content,
+                "model_used": model,
+                "truncated": context.truncated,
+            })
+
+        except Exception as e:
+            logger.exception("Streaming error")
+            yield ("error", {
+                "error": str(e),
+                "partial_content": accumulated_content,
+            })
 
     async def _persist_response(
         self,
