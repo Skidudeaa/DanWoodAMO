@@ -212,6 +212,7 @@ class MessageTypes:
     LLM_STREAMING = "llm_streaming"
     LLM_DONE = "llm_done"
     LLM_ERROR = "llm_error"
+    LLM_CANCELLED = "llm_cancelled"
     ERROR = "error"
     PONG = "pong"
     # Presence & receipts (outbound)

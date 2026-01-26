@@ -1,5 +1,7 @@
 # transport/handlers.py — WebSocket message handlers
 
+import asyncio
+from asyncio import Task, CancelledError
 from datetime import datetime
 from typing import Optional
 from uuid import UUID, uuid4
@@ -25,6 +27,10 @@ class MessageHandler:
     ARCHITECTURE: Dispatches inbound WebSocket messages to appropriate handlers.
     WHY: Clean separation between transport and business logic.
     """
+
+    # Class-level tracking for active LLM streams across handler instances
+    # Key: thread_id, Value: asyncio.Task
+    _active_streams: dict[UUID, Task] = {}
 
     def __init__(
         self,
@@ -574,6 +580,10 @@ class MessageHandler:
         """
         Handle explicit @Claude summon from client.
         Streams LLM response token-by-token via WebSocket.
+
+        ARCHITECTURE: Wraps streaming in asyncio.Task for cancellation support.
+        WHY: Enables stop button to interrupt in-progress responses.
+        TRADEOFF: Slightly more complex, but essential for user control.
         """
         thread_id = payload.get("thread_id")
         if thread_id:
@@ -584,6 +594,13 @@ class MessageHandler:
         if not thread_id:
             await self._send_error(conn, "No active thread for LLM summon")
             return
+
+        # Cancel any existing stream for this thread
+        if thread_id in MessageHandler._active_streams:
+            existing_task = MessageHandler._active_streams[thread_id]
+            if not existing_task.done():
+                existing_task.cancel()
+                logger.info(f"Cancelled existing stream for thread {thread_id}")
 
         use_provoker = payload.get("use_provoker", False)
 
@@ -607,6 +624,42 @@ class MessageHandler:
 
         memories = await self.memory.get_context_for_prompt(conn.room_id)
 
+        # Create streaming task for cancellation support
+        task = asyncio.create_task(
+            self._stream_llm_response(conn, thread_id, room, thread, users, messages, memories, use_provoker)
+        )
+        MessageHandler._active_streams[thread_id] = task
+
+        try:
+            await task
+        except CancelledError:
+            logger.info(f"Stream cancelled for thread {thread_id}")
+            # Notify client that cancellation completed
+            await self.connections.broadcast(conn.room_id, OutboundMessage(
+                type=MessageTypes.LLM_CANCELLED,
+                payload={"thread_id": str(thread_id)},
+            ))
+        finally:
+            # Clean up task tracking
+            MessageHandler._active_streams.pop(thread_id, None)
+
+    async def _stream_llm_response(
+        self,
+        conn: Connection,
+        thread_id: UUID,
+        room: Room,
+        thread: Thread,
+        users: list,
+        messages: list,
+        memories: list,
+        use_provoker: bool,
+    ) -> None:
+        """
+        Execute LLM streaming in a separate coroutine for cancellation support.
+
+        ARCHITECTURE: Extracted from _handle_summon_llm for task wrapping.
+        WHY: asyncio.create_task requires a coroutine, not async for loop.
+        """
         # Generate message_id upfront for streaming correlation
         message_id = uuid4()
 
@@ -659,21 +712,41 @@ class MessageHandler:
         """
         Handle cancel request for in-progress LLM response.
 
-        Note: Full cancellation requires tracking active streaming tasks.
-        For now, logs the request and acknowledges.
-        Future: Use asyncio task tracking to cancel active stream_response.
+        ARCHITECTURE: Uses class-level task tracking to cancel active streams.
+        WHY: Enables stop button to interrupt in-progress responses.
+        TRADEOFF: Class-level dict works for single-server; Redis needed for scale.
         """
-        thread_id = payload.get("thread_id", str(conn.thread_id) if conn.thread_id else None)
-        logger.info(f"LLM cancel requested by user {conn.user_id} for thread {thread_id}")
+        thread_id_str = payload.get("thread_id", str(conn.thread_id) if conn.thread_id else None)
+        logger.info(f"LLM cancel requested by user {conn.user_id} for thread {thread_id_str}")
 
-        # Acknowledge the cancel request
-        await self.connections.send_to_user(conn.user_id, conn.room_id, OutboundMessage(
-            type=MessageTypes.PONG,  # Reuse pong as generic acknowledgment
-            payload={
-                "action": "cancel_llm_acknowledged",
-                "thread_id": thread_id,
-            },
-        ))
+        if thread_id_str:
+            thread_id = UUID(thread_id_str)
+            task = MessageHandler._active_streams.get(thread_id)
+
+            if task and not task.done():
+                task.cancel()
+                logger.info(f"Cancelled LLM stream for thread {thread_id}")
+
+                # LLM_CANCELLED will be sent by the task's except CancelledError handler
+                # Just acknowledge the cancel request here
+                await self.connections.send_to_user(conn.user_id, conn.room_id, OutboundMessage(
+                    type=MessageTypes.PONG,
+                    payload={
+                        "action": "cancel_llm_initiated",
+                        "thread_id": thread_id_str,
+                    },
+                ))
+            else:
+                # No active stream to cancel
+                await self.connections.send_to_user(conn.user_id, conn.room_id, OutboundMessage(
+                    type=MessageTypes.PONG,
+                    payload={
+                        "action": "cancel_llm_no_stream",
+                        "thread_id": thread_id_str,
+                    },
+                ))
+        else:
+            await self._send_error(conn, "No thread_id provided for cancel")
 
     async def _should_send_push(self, user_id: UUID, room_id: UUID) -> bool:
         """
