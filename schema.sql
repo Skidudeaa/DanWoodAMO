@@ -232,3 +232,32 @@ ON messages (thread_id, created_at DESC);
 -- Backfill existing messages with search vectors
 UPDATE messages SET search_vector = to_tsvector('english', COALESCE(content, ''))
 WHERE search_vector IS NULL;
+
+-- ============================================================
+-- PUSH NOTIFICATIONS
+-- ============================================================
+
+-- Push notification tokens (one per user+device pair)
+CREATE TABLE push_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id),
+    expo_push_token TEXT NOT NULL,
+    platform TEXT NOT NULL, -- 'ios' | 'android'
+    device_name TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, expo_push_token)
+);
+
+CREATE INDEX idx_push_tokens_user ON push_tokens(user_id) WHERE is_active = true;
+CREATE INDEX idx_push_tokens_token ON push_tokens(expo_push_token);
+
+-- Room notification settings (per-room mute per CONTEXT.md)
+CREATE TABLE room_notification_settings (
+    user_id UUID NOT NULL REFERENCES users(id),
+    room_id UUID NOT NULL REFERENCES rooms(id),
+    muted BOOLEAN NOT NULL DEFAULT FALSE,
+    muted_until TIMESTAMPTZ, -- Optional temporary mute
+    PRIMARY KEY (user_id, room_id)
+);
