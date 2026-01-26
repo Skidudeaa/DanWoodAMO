@@ -24,6 +24,7 @@ from llm.orchestrator import LLMOrchestrator
 from transport.websocket import ConnectionManager, InboundMessage
 from transport.handlers import MessageHandler
 from api.auth.routes import router as auth_router, set_db_pool as set_auth_db_pool
+from api.notifications.routes import router as notifications_router, set_notifications_db_pool
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -60,6 +61,9 @@ async def lifespan(app: FastAPI):
         # Set db_pool for auth module
         set_auth_db_pool(db_pool)
 
+        # Set db_pool for notifications module
+        set_notifications_db_pool(db_pool)
+
         async with db_pool.acquire() as conn:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     except Exception as e:
@@ -94,6 +98,9 @@ app.add_middleware(
 
 # Include auth router
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
+
+# Include notifications router
+app.include_router(notifications_router)
 
 connection_manager = ConnectionManager()
 
