@@ -186,6 +186,9 @@ class MessageTypes:
     PRESENCE_UPDATE = "presence_update"
     MESSAGE_DELIVERED = "message_delivered"
     MESSAGE_READ = "message_read"
+    # LLM control (inbound)
+    SUMMON_LLM = "summon_llm"
+    CANCEL_LLM = "cancel_llm"
 
     # Outbound
     MESSAGE_CREATED = "message_created"
@@ -198,6 +201,8 @@ class MessageTypes:
     MEMORY_UPDATED = "memory_updated"
     LLM_THINKING = "llm_thinking"
     LLM_STREAMING = "llm_streaming"
+    LLM_DONE = "llm_done"
+    LLM_ERROR = "llm_error"
     ERROR = "error"
     PONG = "pong"
     # Presence & receipts (outbound)
