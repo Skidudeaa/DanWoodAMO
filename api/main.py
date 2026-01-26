@@ -204,6 +204,27 @@ class ThreadResponse(BaseModel):
     message_count: int
 
 
+class ThreadNodeResponse(BaseModel):
+    """
+    Thread node for genealogy tree visualization.
+
+    ARCHITECTURE: Self-referential tree structure with lazy children.
+    WHY: Enables cladogram visualization of fork history.
+    TRADEOFF: Builds tree in Python (O(n)) vs complex SQL.
+    """
+    id: UUID
+    parent_thread_id: Optional[UUID]
+    fork_point_message_id: Optional[UUID]
+    title: Optional[str]
+    message_count: int
+    created_at: datetime
+    depth: int
+    children: List['ThreadNodeResponse'] = []
+
+
+ThreadNodeResponse.model_rebuild()  # For self-reference
+
+
 class SearchResultResponse(BaseModel):
     """Full-text search result with highlighted snippet."""
     id: UUID
@@ -354,6 +375,85 @@ async def list_threads(
         title=row['title'],
         message_count=row['message_count'],
     ) for row in rows]
+
+
+@app.get("/rooms/{room_id}/genealogy", response_model=List[ThreadNodeResponse])
+async def get_thread_genealogy(
+    room_id: UUID,
+    token: str = Query(...),
+    max_depth: int = Query(20, ge=1, le=50, description="Maximum tree depth"),
+    db=Depends(get_db),
+):
+    """
+    Get full thread genealogy for a room as a tree structure.
+
+    ARCHITECTURE: Recursive CTE with depth tracking.
+    WHY: Single query fetches entire tree with depth levels.
+    TRADEOFF: Memory for deep trees, but rooms rarely exceed 10 levels.
+    """
+    await verify_room_token(room_id, token, db)
+
+    # Fetch all threads with message counts using recursive CTE
+    rows = await db.fetch(
+        """
+        WITH RECURSIVE thread_tree AS (
+            -- Base case: root threads (no parent)
+            SELECT
+                t.id,
+                t.parent_thread_id,
+                t.fork_point_message_id,
+                t.title,
+                t.created_at,
+                0 AS depth
+            FROM threads t
+            WHERE t.room_id = $1 AND t.parent_thread_id IS NULL
+
+            UNION ALL
+
+            -- Recursive case: child threads
+            SELECT
+                t.id,
+                t.parent_thread_id,
+                t.fork_point_message_id,
+                t.title,
+                t.created_at,
+                tt.depth + 1
+            FROM threads t
+            JOIN thread_tree tt ON t.parent_thread_id = tt.id
+            WHERE t.room_id = $1 AND tt.depth < $2
+        )
+        SELECT
+            tt.*,
+            (SELECT COUNT(*) FROM messages m WHERE m.thread_id = tt.id) as message_count
+        FROM thread_tree tt
+        ORDER BY tt.depth, tt.created_at
+        """,
+        room_id, max_depth
+    )
+
+    # Build tree structure in Python (flat list to tree)
+    nodes: dict[UUID, ThreadNodeResponse] = {}
+    for row in rows:
+        nodes[row['id']] = ThreadNodeResponse(
+            id=row['id'],
+            parent_thread_id=row['parent_thread_id'],
+            fork_point_message_id=row['fork_point_message_id'],
+            title=row['title'],
+            message_count=row['message_count'],
+            created_at=row['created_at'],
+            depth=row['depth'],
+            children=[],
+        )
+
+    # Assign children to parents
+    roots: List[ThreadNodeResponse] = []
+    for node in nodes.values():
+        if node.parent_thread_id and node.parent_thread_id in nodes:
+            nodes[node.parent_thread_id].children.append(node)
+        else:
+            roots.append(node)
+
+    return roots
 
 
 @app.get("/threads/{thread_id}/messages", response_model=PaginatedMessagesResponse)
