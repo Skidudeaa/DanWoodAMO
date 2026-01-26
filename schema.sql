@@ -201,3 +201,34 @@ CREATE TABLE message_receipts (
 );
 
 CREATE INDEX idx_message_receipts_message ON message_receipts(message_id);
+
+-- ============================================================
+-- FULL-TEXT SEARCH
+-- ============================================================
+
+-- Add search vector column for full-text search
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS search_vector tsvector;
+
+-- GIN index for fast full-text search
+CREATE INDEX IF NOT EXISTS idx_messages_search
+ON messages USING GIN (search_vector);
+
+-- Trigger to auto-update search vector on insert/update
+CREATE OR REPLACE FUNCTION messages_search_trigger() RETURNS trigger AS $$
+BEGIN
+  NEW.search_vector := to_tsvector('english', COALESCE(NEW.content, ''));
+  RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER messages_search_update
+  BEFORE INSERT OR UPDATE ON messages
+  FOR EACH ROW EXECUTE FUNCTION messages_search_trigger();
+
+-- Composite index for date range filtering
+CREATE INDEX IF NOT EXISTS idx_messages_created_at
+ON messages (thread_id, created_at DESC);
+
+-- Backfill existing messages with search vectors
+UPDATE messages SET search_vector = to_tsvector('english', COALESCE(content, ''))
+WHERE search_vector IS NULL;
