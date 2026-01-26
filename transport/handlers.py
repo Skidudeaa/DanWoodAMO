@@ -168,6 +168,15 @@ class MessageHandler:
             }
         ))
 
+        # Trigger push notifications for offline/away users
+        await self._trigger_push_notifications(
+            room_id=conn.room_id,
+            thread_id=thread_id,
+            message=message,
+            sender_name=user_row['display_name'] if user_row else "Unknown",
+            sender_id=conn.user_id,
+        )
+
         mentioned = "@llm" in content.lower()
 
         try:
@@ -242,6 +251,24 @@ class MessageHandler:
                             "truncated": data["truncated"],
                         },
                     ))
+                    # Trigger push for LLM streaming response
+                    llm_message = Message(
+                        id=UUID(data["message_id"]) if isinstance(data["message_id"], str) else data["message_id"],
+                        thread_id=thread_id,
+                        sequence=0,  # Not needed for push
+                        created_at=datetime.utcnow(),
+                        speaker_type=SpeakerType.LLM_PRIMARY,
+                        user_id=None,
+                        message_type=MessageType.TEXT,
+                        content=data["content"],
+                    )
+                    await self._trigger_push_notifications(
+                        room_id=room_id,
+                        thread_id=thread_id,
+                        message=llm_message,
+                        sender_name="Claude",
+                        sender_id=UUID('00000000-0000-0000-0000-000000000000'),  # Sentinel for LLM
+                    )
                 elif event_type == "error":
                     await self.connections.broadcast(room_id, OutboundMessage(
                         type=MessageTypes.LLM_ERROR,
@@ -285,6 +312,15 @@ class MessageHandler:
                     "model_used": result.response.model_used,
                 },
             ))
+            # Trigger push for LLM heuristic interjection
+            sender_name = "Claude" if result.response.speaker_type == SpeakerType.LLM_PRIMARY else "Provoker"
+            await self._trigger_push_notifications(
+                room_id=room_id,
+                thread_id=thread_id,
+                message=result.response,
+                sender_name=sender_name,
+                sender_id=UUID('00000000-0000-0000-0000-000000000000'),  # Sentinel for LLM
+            )
 
     async def _handle_typing(self, conn: Connection, payload: dict) -> None:
         """Broadcast typing indicator."""
