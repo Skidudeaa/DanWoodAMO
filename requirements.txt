@@ -8,3 +8,4 @@ python-multipart==0.0.6
 websockets==12.0
 pyjwt>=2.9.0
 pwdlib[argon2]>=0.2.0
+exponent-server-sdk>=2.0.0
