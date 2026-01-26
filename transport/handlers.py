@@ -55,6 +55,8 @@ class MessageHandler:
             MessageTypes.PRESENCE_UPDATE: self._handle_presence_update,
             MessageTypes.MESSAGE_DELIVERED: self._handle_message_delivered,
             MessageTypes.MESSAGE_READ: self._handle_message_read,
+            MessageTypes.SUMMON_LLM: self._handle_summon_llm,
+            MessageTypes.CANCEL_LLM: self._handle_cancel_llm,
         }
 
         handler = handlers.get(message.type)
@@ -184,11 +186,6 @@ class MessageHandler:
     ) -> None:
         """Invoke LLM orchestrator and broadcast response."""
 
-        await self.connections.broadcast(room_id, OutboundMessage(
-            type=MessageTypes.LLM_THINKING,
-            payload={"thread_id": str(thread_id)},
-        ))
-
         room_row = await self.db.fetchrow("SELECT * FROM rooms WHERE id = $1", room_id)
         room = Room(**dict(room_row))
 
@@ -207,6 +204,60 @@ class MessageHandler:
         messages = await get_thread_messages(self.db, thread_id, include_ancestry=True)
 
         memories = await self.memory.get_context_for_prompt(room_id)
+
+        # Use streaming for explicit @Claude mentions
+        if mentioned:
+            message_id = uuid4()
+            async for event_type, data in self.llm.stream_response(
+                room=room,
+                thread=thread,
+                users=users,
+                messages=messages,
+                memories=memories,
+                use_provoker=False,
+            ):
+                if event_type == "thinking":
+                    await self.connections.broadcast(room_id, OutboundMessage(
+                        type=MessageTypes.LLM_THINKING,
+                        payload={"thread_id": str(thread_id)},
+                    ))
+                elif event_type == "streaming":
+                    await self.connections.broadcast(room_id, OutboundMessage(
+                        type=MessageTypes.LLM_STREAMING,
+                        payload={
+                            "thread_id": str(thread_id),
+                            "message_id": str(message_id),
+                            "token": data["token"],
+                            "index": data["index"],
+                        },
+                    ))
+                elif event_type == "done":
+                    await self.connections.broadcast(room_id, OutboundMessage(
+                        type=MessageTypes.LLM_DONE,
+                        payload={
+                            "thread_id": str(thread_id),
+                            "message_id": data["message_id"],
+                            "content": data["content"],
+                            "model_used": data["model_used"],
+                            "truncated": data["truncated"],
+                        },
+                    ))
+                elif event_type == "error":
+                    await self.connections.broadcast(room_id, OutboundMessage(
+                        type=MessageTypes.LLM_ERROR,
+                        payload={
+                            "thread_id": str(thread_id),
+                            "error": data["error"],
+                            "partial_content": data["partial_content"],
+                        },
+                    ))
+            return
+
+        # Non-streaming path for heuristic interjections
+        await self.connections.broadcast(room_id, OutboundMessage(
+            type=MessageTypes.LLM_THINKING,
+            payload={"thread_id": str(thread_id)},
+        ))
 
         result = await self.llm.on_message(
             room=room,
@@ -482,6 +533,111 @@ class MessageHandler:
                     },
                 )
             )
+
+    async def _handle_summon_llm(self, conn: Connection, payload: dict) -> None:
+        """
+        Handle explicit @Claude summon from client.
+        Streams LLM response token-by-token via WebSocket.
+        """
+        thread_id = payload.get("thread_id")
+        if thread_id:
+            thread_id = UUID(thread_id)
+        else:
+            thread_id = conn.thread_id
+
+        if not thread_id:
+            await self._send_error(conn, "No active thread for LLM summon")
+            return
+
+        use_provoker = payload.get("use_provoker", False)
+
+        # Load context
+        room_row = await self.db.fetchrow("SELECT * FROM rooms WHERE id = $1", conn.room_id)
+        room = Room(**dict(room_row))
+
+        thread_row = await self.db.fetchrow("SELECT * FROM threads WHERE id = $1", thread_id)
+        thread = Thread(**dict(thread_row))
+
+        user_rows = await self.db.fetch(
+            """SELECT u.* FROM users u
+               JOIN room_memberships rm ON u.id = rm.user_id
+               WHERE rm.room_id = $1""",
+            conn.room_id
+        )
+        users = [User(**dict(row)) for row in user_rows]
+
+        from operations import get_thread_messages
+        messages = await get_thread_messages(self.db, thread_id, include_ancestry=True)
+
+        memories = await self.memory.get_context_for_prompt(conn.room_id)
+
+        # Generate message_id upfront for streaming correlation
+        message_id = uuid4()
+
+        # Stream response and broadcast events
+        async for event_type, data in self.llm.stream_response(
+            room=room,
+            thread=thread,
+            users=users,
+            messages=messages,
+            memories=memories,
+            use_provoker=use_provoker,
+        ):
+            if event_type == "thinking":
+                await self.connections.broadcast(conn.room_id, OutboundMessage(
+                    type=MessageTypes.LLM_THINKING,
+                    payload={"thread_id": str(thread_id)},
+                ))
+            elif event_type == "streaming":
+                await self.connections.broadcast(conn.room_id, OutboundMessage(
+                    type=MessageTypes.LLM_STREAMING,
+                    payload={
+                        "thread_id": str(thread_id),
+                        "message_id": str(message_id),
+                        "token": data["token"],
+                        "index": data["index"],
+                    },
+                ))
+            elif event_type == "done":
+                await self.connections.broadcast(conn.room_id, OutboundMessage(
+                    type=MessageTypes.LLM_DONE,
+                    payload={
+                        "thread_id": str(thread_id),
+                        "message_id": data["message_id"],
+                        "content": data["content"],
+                        "model_used": data["model_used"],
+                        "truncated": data["truncated"],
+                    },
+                ))
+            elif event_type == "error":
+                await self.connections.broadcast(conn.room_id, OutboundMessage(
+                    type=MessageTypes.LLM_ERROR,
+                    payload={
+                        "thread_id": str(thread_id),
+                        "error": data["error"],
+                        "partial_content": data["partial_content"],
+                    },
+                ))
+
+    async def _handle_cancel_llm(self, conn: Connection, payload: dict) -> None:
+        """
+        Handle cancel request for in-progress LLM response.
+
+        Note: Full cancellation requires tracking active streaming tasks.
+        For now, logs the request and acknowledges.
+        Future: Use asyncio task tracking to cancel active stream_response.
+        """
+        thread_id = payload.get("thread_id", str(conn.thread_id) if conn.thread_id else None)
+        logger.info(f"LLM cancel requested by user {conn.user_id} for thread {thread_id}")
+
+        # Acknowledge the cancel request
+        await self.connections.send_to_user(conn.user_id, conn.room_id, OutboundMessage(
+            type=MessageTypes.PONG,  # Reuse pong as generic acknowledgment
+            payload={
+                "action": "cancel_llm_acknowledged",
+                "thread_id": thread_id,
+            },
+        ))
 
     async def _send_error(self, conn: Connection, error: str) -> None:
         """Send error to client."""
