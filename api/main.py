@@ -1,8 +1,9 @@
 # api/main.py — FastAPI application
 
+import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import AsyncGenerator, List, Optional
 from uuid import UUID, uuid4
 import asyncpg
 import logging
@@ -25,9 +26,62 @@ from transport.websocket import ConnectionManager, InboundMessage
 from transport.handlers import MessageHandler
 from api.auth.routes import router as auth_router, set_db_pool as set_auth_db_pool
 from api.notifications.routes import router as notifications_router, set_notifications_db_pool
+from collections import defaultdict
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# RATE LIMITING
+# ============================================================
+
+class RateLimiter:
+    """
+    Simple in-memory rate limiter.
+
+    ARCHITECTURE: Token bucket algorithm with per-IP tracking.
+    WHY: Prevents brute force without external dependencies.
+    TRADEOFF: Memory grows with unique IPs; single-server only.
+    """
+    def __init__(self):
+        self._requests: dict[str, list[float]] = defaultdict(list)
+
+    def is_allowed(self, key: str, limit: int, window_seconds: int) -> bool:
+        """Check if request is allowed under rate limit."""
+        now = time.time()
+        cutoff = now - window_seconds
+
+        # Clean old requests
+        self._requests[key] = [t for t in self._requests[key] if t > cutoff]
+
+        if len(self._requests[key]) >= limit:
+            return False
+
+        self._requests[key].append(now)
+        return True
+
+rate_limiter = RateLimiter()
+
+
+from fastapi import Request
+
+async def check_rate_limit(
+    request: Request,
+    limit: int = 60,
+    window: int = 60,
+) -> None:
+    """Rate limit dependency - raises 429 if exceeded."""
+    client_ip = request.client.host if request.client else "unknown"
+    endpoint = request.url.path
+    key = f"{client_ip}:{endpoint}"
+
+    if not rate_limiter.is_allowed(key, limit, window):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please try again later."
+        )
 
 
 # ============================================================
@@ -42,7 +96,7 @@ DATABASE_URL = os.environ.get(
 db_pool: Optional[asyncpg.Pool] = None
 
 
-async def get_db():
+async def get_db() -> AsyncGenerator[asyncpg.Connection, None]:
     """Dependency for database connection."""
     async with db_pool.acquire() as conn:
         yield conn
@@ -88,15 +142,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS configuration - explicit origins to prevent CSRF attacks
+# ARCHITECTURE: Environment-configurable allowed origins with sensible defaults.
+# WHY: Wildcard origins with credentials enabled is a security vulnerability.
+# TRADEOFF: Requires configuration for production deployments.
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,http://localhost:8000"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Include auth router
+# NOTE: Auth routes in api/auth/routes.py should implement rate limiting:
+# - /auth/login: 5 requests per minute
+# - /auth/signup: 3 requests per minute
+# - /auth/refresh: 10 requests per minute
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 
 # Include notifications router
@@ -112,7 +179,7 @@ connection_manager = ConnectionManager()
 async def verify_room_token(
     room_id: UUID,
     token: str,
-    db,
+    db: asyncpg.Connection,
 ) -> Room:
     """Verify room token and return room if valid."""
     row = await db.fetchrow(
@@ -272,7 +339,7 @@ async def create_room(
     """Create a new room."""
     room_id = uuid4()
     token = uuid4().hex
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     await db.execute(
         """INSERT INTO rooms (id, created_at, token, name, global_ontology, global_rules)
@@ -310,7 +377,7 @@ async def create_user(
 ):
     """Create a new user."""
     user_id = uuid4()
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     await db.execute(
         """INSERT INTO users
@@ -347,7 +414,7 @@ async def join_room(
     if existing:
         return {"status": "already_member"}
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     await db.execute(
         """INSERT INTO room_memberships (room_id, user_id, joined_at)
@@ -551,7 +618,7 @@ async def update_room_settings(
     await db.execute(
         """INSERT INTO events (id, timestamp, event_type, room_id, user_id, payload)
            VALUES ($1, $2, $3, $4, $5, $6)""",
-        uuid4(), datetime.utcnow(), EventType.ROOM_SETTINGS_UPDATED.value,
+        uuid4(), datetime.now(timezone.utc), EventType.ROOM_SETTINGS_UPDATED.value,
         room_id, user_id, request.model_dump(exclude_none=True)
     )
 
@@ -595,23 +662,53 @@ async def get_messages(
     await verify_room_token(thread_row['room_id'], token, db)
 
     if include_ancestry:
-        from operations import get_thread_messages
-        all_messages = await get_thread_messages(db, thread_id, include_ancestry=True)
+        # ARCHITECTURE: Single recursive CTE instead of N+1 queries.
+        # WHY: Fetches entire thread ancestry in one database round-trip.
+        # TRADEOFF: More complex SQL, but O(1) queries vs O(depth) queries.
 
-        # Apply cursor filters
+        all_rows = await db.fetch(
+            """
+            WITH RECURSIVE thread_ancestry AS (
+                -- Base case: current thread
+                SELECT id, parent_thread_id, fork_point_message_id, 0 as depth
+                FROM threads WHERE id = $1
+
+                UNION ALL
+
+                -- Recursive case: parent threads
+                SELECT t.id, t.parent_thread_id, t.fork_point_message_id, ta.depth + 1
+                FROM threads t
+                JOIN thread_ancestry ta ON t.id = ta.parent_thread_id
+                WHERE ta.depth < 50  -- Safety limit
+            )
+            SELECT m.* FROM messages m
+            JOIN thread_ancestry ta ON m.thread_id = ta.id
+            WHERE NOT m.is_deleted
+              AND (
+                  ta.depth = 0  -- Current thread: all messages
+                  OR m.sequence <= COALESCE(
+                      (SELECT sequence FROM messages
+                       WHERE id = (SELECT fork_point_message_id FROM threads WHERE id = ta.id)),
+                      m.sequence
+                  )
+              )
+            ORDER BY m.created_at, m.sequence
+            """,
+            thread_id
+        )
+        all_messages = [Message(**dict(row)) for row in all_rows]
+
+        # Apply cursor filters (keep existing logic)
         if before_sequence is not None:
             all_messages = [m for m in all_messages if m.sequence < before_sequence]
-            # Get most recent N (from end)
             messages = all_messages[-limit:]
         elif after_sequence is not None:
             all_messages = [m for m in all_messages if m.sequence > after_sequence]
-            # Get oldest N (from start)
             messages = all_messages[:limit]
         else:
-            # Default: most recent messages
             messages = all_messages[-limit:]
 
-        # Calculate has_more flags
+        # Calculate has_more flags (keep existing logic)
         if messages:
             oldest_seq = min(m.sequence for m in messages)
             newest_seq = max(m.sequence for m in messages)
@@ -706,22 +803,26 @@ async def send_message(
 
     room = await verify_room_token(thread_row['room_id'], token, db)
 
-    max_seq = await db.fetchval(
-        "SELECT COALESCE(MAX(sequence), 0) FROM messages WHERE thread_id = $1",
-        thread_id
-    )
-    sequence = max_seq + 1
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     message_id = uuid4()
 
     await db.execute(
         """INSERT INTO messages
            (id, thread_id, sequence, created_at, speaker_type, user_id,
             message_type, content, references_message_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
-        message_id, thread_id, sequence, now,
+           VALUES (
+               $1, $2,
+               (SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE thread_id = $2),
+               $3, $4, $5, $6, $7, $8
+           )""",
+        message_id, thread_id, now,
         SpeakerType.HUMAN.value, user_id, request.message_type,
         request.content, request.references_message_id
+    )
+
+    # Get the actual sequence that was assigned
+    sequence = await db.fetchval(
+        "SELECT sequence FROM messages WHERE id = $1", message_id
     )
 
     await db.execute(
@@ -1069,12 +1170,35 @@ async def get_message_context(
 async def websocket_endpoint(
     websocket: WebSocket,
     room_id: UUID,
-    token: str = Query(...),
-    user_id: UUID = Query(...),
-    thread_id: Optional[UUID] = Query(None),
 ):
     """WebSocket connection for real-time messaging."""
+    await websocket.accept()
 
+    # Wait for auth message with timeout
+    try:
+        auth_data = await asyncio.wait_for(
+            websocket.receive_json(),
+            timeout=5.0
+        )
+        token = auth_data.get("token")
+        user_id_str = auth_data.get("user_id")
+        thread_id_str = auth_data.get("thread_id")
+
+        if not token or not user_id_str:
+            await websocket.close(code=4001, reason="Missing credentials")
+            return
+
+        user_id = UUID(user_id_str)
+        thread_id = UUID(thread_id_str) if thread_id_str else None
+
+    except asyncio.TimeoutError:
+        await websocket.close(code=4001, reason="Auth timeout")
+        return
+    except (KeyError, ValueError, TypeError):
+        await websocket.close(code=4001, reason="Invalid auth data")
+        return
+
+    # Now validate room token and membership
     async with db_pool.acquire() as db:
         room_row = await db.fetchrow(
             "SELECT * FROM rooms WHERE id = $1 AND token = $2",
@@ -1130,6 +1254,130 @@ async def websocket_endpoint(
 async def health():
     """Health check."""
     return {"status": "ok"}
+
+
+# ============================================================
+# USER ENDPOINTS
+# ============================================================
+
+class UserRoomResponse(BaseModel):
+    """Room with unread count for user's room list."""
+    id: UUID
+    name: Optional[str]
+    unread_count: int
+    last_message_at: Optional[datetime]
+    last_message_preview: Optional[str]
+
+
+@app.get("/users/me/rooms", response_model=List[UserRoomResponse])
+async def get_user_rooms(
+    user_id: UUID = Query(...),
+    db=Depends(get_db),
+):
+    """
+    Get rooms the user is a member of with unread message counts.
+
+    ARCHITECTURE: Single query with subqueries for efficiency.
+    WHY: Enables room list with unread badges in sidebar.
+    """
+    rows = await db.fetch(
+        """
+        SELECT
+            r.id,
+            r.name,
+            (
+                SELECT COUNT(*) FROM messages m
+                JOIN threads t ON m.thread_id = t.id
+                WHERE t.room_id = r.id
+                  AND m.created_at > COALESCE(
+                      (SELECT MAX(timestamp) FROM message_receipts mr
+                       WHERE mr.user_id = $1 AND mr.receipt_type = 'read'
+                       AND mr.message_id IN (
+                           SELECT id FROM messages WHERE thread_id = t.id
+                       )),
+                      rm.joined_at
+                  )
+                  AND (m.user_id IS NULL OR m.user_id != $1)
+            ) as unread_count,
+            (
+                SELECT m.created_at FROM messages m
+                JOIN threads t ON m.thread_id = t.id
+                WHERE t.room_id = r.id
+                ORDER BY m.created_at DESC LIMIT 1
+            ) as last_message_at,
+            (
+                SELECT LEFT(m.content, 50) FROM messages m
+                JOIN threads t ON m.thread_id = t.id
+                WHERE t.room_id = r.id
+                ORDER BY m.created_at DESC LIMIT 1
+            ) as last_message_preview
+        FROM rooms r
+        JOIN room_memberships rm ON r.id = rm.room_id
+        WHERE rm.user_id = $1
+        ORDER BY last_message_at DESC NULLS LAST
+        """,
+        user_id
+    )
+
+    return [UserRoomResponse(
+        id=row['id'],
+        name=row['name'],
+        unread_count=row['unread_count'] or 0,
+        last_message_at=row['last_message_at'],
+        last_message_preview=row['last_message_preview'],
+    ) for row in rows]
+
+
+class PresenceUserResponse(BaseModel):
+    """User presence info for room."""
+    user_id: UUID
+    display_name: str
+    status: str
+    last_heartbeat: Optional[datetime]
+
+
+@app.get("/rooms/{room_id}/presence", response_model=List[PresenceUserResponse])
+async def get_room_presence(
+    room_id: UUID,
+    token: str = Query(...),
+    db=Depends(get_db),
+):
+    """
+    Get presence status for all users in a room.
+
+    ARCHITECTURE: Joins memberships with presence table.
+    WHY: Enables online users sidebar panel.
+    """
+    await verify_room_token(room_id, token, db)
+
+    rows = await db.fetch(
+        """
+        SELECT
+            u.id as user_id,
+            u.display_name,
+            COALESCE(up.status, 'offline') as status,
+            up.last_heartbeat
+        FROM room_memberships rm
+        JOIN users u ON rm.user_id = u.id
+        LEFT JOIN user_presence up ON u.id = up.user_id AND up.room_id = $1
+        WHERE rm.room_id = $1
+        ORDER BY
+            CASE up.status
+                WHEN 'online' THEN 1
+                WHEN 'away' THEN 2
+                ELSE 3
+            END,
+            u.display_name
+        """,
+        room_id
+    )
+
+    return [PresenceUserResponse(
+        user_id=row['user_id'],
+        display_name=row['display_name'],
+        status=row['status'],
+        last_heartbeat=row['last_heartbeat'],
+    ) for row in rows]
 
 
 @app.get("/rooms/{room_id}/events")
