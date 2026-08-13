@@ -846,7 +846,16 @@
             $('#userAvatar').textContent = state.userName ? state.userName[0].toUpperCase() : '?';
 
             if (state.roomId) {
-                $('#roomNameDisplay').textContent = 'Room';
+                // Use the resolved room name when we have it. switchRoom() may have
+                // already set this correctly before enterApp() ran (that is the
+                // order handleAuthSuccess uses), so only fall back to the generic
+                // label when the room really is unknown.
+                const knownRoom = state.rooms.find(r => r.id === state.roomId);
+                if (knownRoom) {
+                    $('#roomNameDisplay').textContent = knownRoom.name || 'Room';
+                } else if (!$('#roomNameDisplay').textContent.trim()) {
+                    $('#roomNameDisplay').textContent = 'Room';
+                }
 
                 // Generate share link
                 const shareUrl = new URL(window.location.href);
@@ -1180,14 +1189,37 @@
 
             showTypingIndicator(false);
 
-            // Convert streaming element to permanent message
+            // Promote the streaming element in place.
+            //
+            // BEHAVIORAL FIX: this used to remove `#streaming-<id>` and then look for a
+            // separate `.message[data-id=...]` to finalize. No such element is ever
+            // created — createStreamingMessageElement() only makes the `#streaming-<id>`
+            // div — so unless the server also emitted `message_created` for the same
+            // message, the finished reply was deleted and never re-rendered. Promoting
+            // the existing node makes completion correct on its own, and
+            // addMessageToUI()'s duplicate guard (matching on data-id) means a
+            // subsequent `message_created` for the same id is still ignored.
+            const finalId = messageId || state.currentStreamId;
             const streamingEl = $(`#streaming-${state.currentStreamId}`);
+            let el = $(`.message[data-id="${finalId}"]`);
+
             if (streamingEl) {
-                streamingEl.remove();
+                // Shed the transient id so a later stream can reuse it, and adopt the
+                // server's message id so replies and forks can reference this message.
+                streamingEl.removeAttribute('id');
+                streamingEl.dataset.id = finalId;
+                const contentEl = streamingEl.querySelector('.message-content');
+                if (contentEl) contentEl.removeAttribute('id');
+
+                if (el && el !== streamingEl) {
+                    // The server already delivered this message through the normal
+                    // path; drop the streaming duplicate rather than showing both.
+                    streamingEl.remove();
+                } else {
+                    el = streamingEl;
+                }
             }
 
-            // Also try with data-id selector for backwards compatibility
-            const el = $(`.message[data-id="${messageId || state.currentStreamId}"]`);
             if (el) {
                 el.classList.remove('streaming');
                 el.querySelector('.message-content').innerHTML = renderMarkdown(finalContent || state.streamingMessage.content);
@@ -1210,7 +1242,24 @@
                 }
             }
 
-            state.lastMessageId = messageId || state.currentStreamId;
+            // Record it in state so a reply that references this message can resolve
+            // its quotation. Without this the message exists in the DOM but not in
+            // state.messages, and createMessageElement() silently omits the reference.
+            if (!state.messages.some(m => m.id === finalId)) {
+                state.messages.push({
+                    id: finalId,
+                    thread_id: state.streamingMessage ? state.streamingMessage.threadId : state.currentThreadId,
+                    speaker_type: 'llm',
+                    user_id: null,
+                    user_name: null,
+                    message_type: 'text',
+                    content: finalContent || (state.streamingMessage ? state.streamingMessage.content : ''),
+                    references_message_id: null,
+                    created_at: new Date().toISOString(),
+                });
+            }
+
+            state.lastMessageId = finalId;
             cleanupStreamState();
             scrollToBottom();
         }
@@ -1234,8 +1283,18 @@
 
             const streamingEl = $(`#streaming-${state.currentStreamId}`);
             if (streamingEl) {
+                // The partial stays on the record, per the product rule that an
+                // interrupted thought is still part of the transcript. Drop the
+                // streaming class so the caret and pulse stop, and shed the transient
+                // ids so the next stream can reuse them.
+                streamingEl.classList.remove('streaming');
                 streamingEl.classList.add('cancelled');
-                // Mark as cancelled but keep visible
+                streamingEl.removeAttribute('id');
+                streamingEl.querySelector('.message-content')?.removeAttribute('id');
+
+                const indicator = streamingEl.querySelector('.streaming-indicator');
+                if (indicator) indicator.remove();
+
                 const cancelLabel = document.createElement('span');
                 cancelLabel.className = 'cancelled-label';
                 cancelLabel.textContent = ' (cancelled)';
